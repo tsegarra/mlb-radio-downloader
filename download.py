@@ -1,6 +1,5 @@
-import os
+import sys
 import re
-import argparse
 import random
 import string
 import requests
@@ -8,287 +7,288 @@ import subprocess
 import pytz
 import dateutil.parser
 import lxml, lxml.etree
+from getpass import getpass
 from itertools import chain
-from orderedattrdict import AttrDict
 from six import StringIO
 from datetime import datetime, timedelta
 
-def fetch_all_teams(session, game_date):
-  teams_url = ("http://statsapi.mlb.com/api/v1/teams"
-      "?sportId=1&" + str(game_date.year))
+class MlbApiUtil():
+  def __init__(self, game_date, team_abbr):
+    self.session = requests.Session()
+    self.game_date = game_date
+    self.team = self._get_team_id(team_abbr)
+    self.game = self._get_game_info()
+    self.streams = self._get_all_streams()
 
-  #TODO does this need to be an attrdict?
-  return AttrDict(
-      (team["abbreviation"].lower(), team["id"])
-      for team in sorted(session.get(teams_url).json()["teams"],
-                         key=lambda t: t["fileCode"])
-  )
+  def _get_team_id(self, abbr):
+    teams_url = ("http://statsapi.mlb.com/api/v1/teams"
+        "?sportId=1&" + str(self.game_date.year))
+    teams = self.session.get(teams_url).json()["teams"]
+    for team in teams:
+      if team["abbreviation"].lower() == abbr.lower():
+        return team["id"]
+    print("The team abbreviation you provided is not valid.")
+    print("Please use one from the list below:")
+    print(", ".join([team["abbreviation"] for team in teams]))
+    sys.exit(1)
 
-def fetch_schedule(session, game_date, team_id):
-  SCHEDULE_TEMPLATE = (
-    "http://statsapi.mlb.com/api/v1/schedule"
-    "?sportId=1&startDate={start}&endDate={end}"
-    "&teamId={team_id}"
-    "&hydrate=linescore,team,game(content(summary,media(epg)),tickets)"
-  )
+  def _get_game_info(self):
+    url = (
+      "http://statsapi.mlb.com/api/v1/schedule"
+      "?sportId=1&startDate={date}&endDate={date}"
+      "&teamId={team_id}"
+      "&hydrate=linescore,team,game(content(summary,media(epg)),tickets)"
+    ).format(
+      date = self.game_date.strftime("%Y-%m-%d"),
+      team_id = self.team,
+    )
+    schedule = self.session.get(url).json()
+    return schedule["dates"][0]["games"][0]
 
-  url = SCHEDULE_TEMPLATE.format(
-      start = game_date.strftime("%Y-%m-%d"),
-      end = game_date.strftime("%Y-%m-%d"),
-      team_id = team_id,
-  )
-  return session.get(url).json()
+  def _get_all_streams(self):
+    try:
+      streams = []
+      for epg in self.game["content"]["media"]["epg"]:
+        if epg['title'] == 'Audio':
+          for audioStream in epg['items']:
+            # Note: audioStream['mediaFeedSubType'] = team_id
+            streams.append({
+              'callLetters': audioStream['callLetters'],
+              'mediaId': audioStream['mediaId']
+            })
+      return streams
+    except KeyError:
+      print("Audio for the game you requested is not available.")
+      sys.exit(1)
 
-def get_media_id(game):
-  for epg in game["content"]["media"]["epg"]:
-    if epg['title'] == 'Audio':
-      for audioStream in epg['items']:
-        # NB you can filter by audioStream['mediaFeedSubType'] = team_id
-        # TODO dynamic choice of stream
-        if audioStream['callLetters'] == 'WCBS 880':
-          stream = audioStream
-          return audioStream['mediaId']
+  def _random_string(self, n):
+    return ''.join(
+      random.choice(
+        string.ascii_uppercase + string.digits
+      ) for _ in range(n)
+    )
 
-def fetch_session_token(session, username, password):
-  AUTHN_PARAMS = {
-    'username': username,
-    'password': password,
-    'options': {
-      'multiOptionalFactorEnroll': False,
-      'warnBeforePasswordExpired': True,
-    },
-  }
+  def _get_credentials_from_user(self):
+    print("Enter your MLB.TV username:")
+    self.username = input()
+    self.password = getpass()
 
-  authn_response = session.post("https://ids.mlb.com/api/v1/authn",
-    json=AUTHN_PARAMS).json()
-  return authn_response['sessionToken']
+  def _get_session_token(self):
+    self._get_credentials_from_user()
+    response = self.session.post("https://ids.mlb.com/api/v1/authn",
+      json={
+        "username": self.username,
+        "password": self.password,
+      }).json()
+    self.session_token = response["sessionToken"]
 
-def fetch_access_token(session, session_token, USER_AGENT, PLATFORM):
-  MLB_OKTA_URL = 'https://www.mlbstatic.com/mlb.com/vendor/mlb-okta/mlb-okta.js'
-  AUTHZ_URL = "https://ids.mlb.com/oauth2/aus1m088yK07noBfh356/v1/authorize"
+  def _get_access_token(self):
+    self._get_session_token()
 
-  content = session.get(MLB_OKTA_URL).text
-  OKTA_CLIENT_ID_RE = re.compile("""production:{clientId:"([^"]+)",""")
-  okta_client_id = OKTA_CLIENT_ID_RE.search(content).groups()[0]
+    okta_url = 'https://www.mlbstatic.com/mlb.com/vendor/mlb-okta/mlb-okta.js'
+    mlb_auth_url = "https://ids.mlb.com/oauth2/aus1m088yK07noBfh356/v1/authorize"
 
-  def gen_random_string(n):
-      return ''.join(
-          random.choice(
-              string.ascii_uppercase + string.digits
-          ) for _ in range(64)
-      )
+    content = self.session.get(okta_url).text
+    okta_client_id_re = re.compile("""production:{clientId:"([^"]+)",""")
+    okta_client_id = okta_client_id_re.search(content).groups()[0]
 
-  AUTHZ_PARAMS = {
+    authz_response = self.session.get(mlb_auth_url, params = {
       "client_id": okta_client_id,
       "redirect_uri": "https://www.mlb.com/login",
       "response_type": "id_token token",
       "response_mode": "okta_post_message",
-      "state": gen_random_string(64),
-      "nonce": gen_random_string(64),
+      "state": self._random_string(64),
+      "nonce": self._random_string(64),
       "prompt": "none",
-      "sessionToken": session_token,
+      "sessionToken": self.session_token,
       "scope": "openid email"
-  }
-  authz_response = session.get(AUTHZ_URL, params=AUTHZ_PARAMS)
-  authz_content = authz_response.text
+    })
+    authz_content = authz_response.text
 
-  for line in authz_content.split("\n"):
+    for line in authz_content.split("\n"):
       if "data.access_token" in line:
-          OKTA_ACCESS_TOKEN = line.split("'")[1].encode('utf-8').decode('unicode_escape')
-          break
-  else:
+        okta_access_token = line.split("'")[1].encode('utf-8').decode('unicode_escape')
+        break
+    else:
       raise Exception(authz_content)
 
-  MLB_API_KEY_URL = "https://www.mlb.com/tv/g490865/"
-  content = session.get(MLB_API_KEY_URL).text
-  parser = lxml.etree.HTMLParser()
-  data = lxml.etree.parse(StringIO(content), parser)
+    content = self.session.get("https://www.mlb.com/tv/g490865/").text
+    parser = lxml.etree.HTMLParser()
+    data = lxml.etree.parse(StringIO(content), parser)
 
-  API_KEY_RE = re.compile(r'"x-api-key","value":"([^"]+)"')
-  CLIENT_API_KEY_RE = re.compile(r'"clientApiKey":"([^"]+)"')
-  scripts = data.xpath(".//script")
-  for script in scripts:
+    x_api_key_re = re.compile(r'"x-api-key","value":"([^"]+)"')
+    client_api_key_re = re.compile(r'"clientApiKey":"([^"]+)"')
+    scripts = data.xpath(".//script")
+    for script in scripts:
       if script.text and "x-api-key" in script.text:
-          api_key = API_KEY_RE.search(script.text).groups()[0]
+        api_key = x_api_key_re.search(script.text).groups()[0]
       if script.text and "clientApiKey" in script.text:
-          client_api_key = CLIENT_API_KEY_RE.search(script.text).groups()[0]
+        client_api_key = client_api_key_re.search(script.text).groups()[0]
 
-  DEVICES_HEADERS = {
-      "Authorization": "Bearer %s" % (client_api_key),
-      "Origin": "https://www.mlb.com",
-  }
+    devices_headers = {
+        "Authorization": "Bearer %s" % (client_api_key),
+        "Origin": "https://www.mlb.com",
+    }
 
-  DEVICES_PARAMS = {
-      "applicationRuntime": "firefox",
-      "attributes": {},
-      "deviceFamily": "browser",
-      "deviceProfile": "macosx"
-  }
+    devices_response = self.session.post(
+        "https://us.edge.bamgrid.com/devices",
+        headers=devices_headers, json = {
+          "applicationRuntime": "firefox",
+          "attributes": {},
+          "deviceFamily": "browser",
+          "deviceProfile": "macosx"
+        }
+    ).json()
 
-  BAM_DEVICES_URL = "https://us.edge.bamgrid.com/devices"
-  devices_response = session.post(
-      BAM_DEVICES_URL,
-      headers=DEVICES_HEADERS, json=DEVICES_PARAMS
-  ).json()
+    bam_token_url = "https://us.edge.bamgrid.com/token"
+    token_response = self.session.post(
+      bam_token_url, headers=devices_headers, data = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "latitude": "0",
+        "longitude": "0",
+        "platform": "browser",
+        "subject_token": devices_response["assertion"],
+        "subject_token_type": "urn:bamtech:params:oauth:token-type:device"
+      }
+    ).json()
 
-  DEVICES_ASSERTION=devices_response["assertion"]
+    device_access_token = token_response["access_token"]
 
-  TOKEN_PARAMS = {
-      "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-      "latitude": "0",
-      "longitude": "0",
-      "platform": "browser",
-      "subject_token": DEVICES_ASSERTION,
-      "subject_token_type": "urn:bamtech:params:oauth:token-type:device"
-  }
-  BAM_TOKEN_URL = "https://us.edge.bamgrid.com/token"
-  token_response = session.post(
-      BAM_TOKEN_URL, headers=DEVICES_HEADERS, data=TOKEN_PARAMS
-  ).json()
+    session_response = self.session.get(
+        "https://us.edge.bamgrid.com/session",
+        headers={
+          "Authorization": device_access_token,
+          "Origin": "https://www.mlb.com",
+          "Accept": "application/vnd.session-service+json; version=1",
+          "Accept-Encoding": "gzip, deflate, br",
+          "Accept-Language": "en-US,en;q=0.5",
+          "x-bamsdk-version": "3.4",
+          "Content-type": "application/json",
+          "TE": "Trailers"
+        }
+    ).json()
+     
+    entitlement_response = self.session.get(
+        "https://media-entitlement.mlb.com/api/v3/jwt",
+        headers={
+          "Authorization": "Bearer %s" % (okta_access_token),
+          "Origin": "https://www.mlb.com",
+          "x-api-key": api_key
+        },
+        params={
+          "os": '',
+          "did": session_response["device"]["id"],
+          "appname": "mlbtv_web"
+        }
+    )
 
+    response = self.session.post(
+      bam_token_url,
+      data={
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "platform": "browser",
+        "subject_token": entitlement_response.content,
+        "subject_token_type": "urn:bamtech:params:oauth:token-type:account"
+      },
+      headers={
+        "Authorization": "Bearer %s" % (client_api_key),
+        "Accept": "application/vnd.media-service+json; version=1",
+        "x-bamsdk-version": "3.4",
+        "origin": "https://www.mlb.com"
+      }
+    )
+    response.raise_for_status()
+    token_response = response.json()
 
-  DEVICE_ACCESS_TOKEN = token_response["access_token"]
-  DEVICE_REFRESH_TOKEN = token_response["refresh_token"]
+    access_token_expiry = datetime.now(tz=pytz.UTC) + \
+      timedelta(seconds=token_response["expires_in"])
+    self.access_token = token_response["access_token"]
 
-  BAM_SDK_VERSION = "3.4"
-  SESSION_HEADERS = {
-      "Authorization": DEVICE_ACCESS_TOKEN,
-      "User-agent": USER_AGENT,
-      "Origin": "https://www.mlb.com",
-      "Accept": "application/vnd.session-service+json; version=1",
-      "Accept-Encoding": "gzip, deflate, br",
-      "Accept-Language": "en-US,en;q=0.5",
-      "x-bamsdk-version": BAM_SDK_VERSION,
-      "x-bamsdk-platform": PLATFORM,
-      "Content-type": "application/json",
-      "TE": "Trailers"
-  }
-  BAM_SESSION_URL = "https://us.edge.bamgrid.com/session"
-  session_response = session.get(
-      BAM_SESSION_URL,
-      headers=SESSION_HEADERS
-  ).json()
-  DEVICE_ID = session_response["device"]["id"]
+  def _run_streamlink(self, media_url, outfile_name):
+    header_args = []
+    cookie_args = []
 
-  ENTITLEMENT_PARAMS={
-      "os": PLATFORM,
-      "did": DEVICE_ID,
-      "appname": "mlbtv_web"
-  }
+    self.session.headers = { "Authorization": self.access_token }
 
-  ENTITLEMENT_HEADERS = {
-      "Authorization": "Bearer %s" % (OKTA_ACCESS_TOKEN),
-      "Origin": "https://www.mlb.com",
-      "x-api-key": api_key
+    header_args = list(
+      chain.from_iterable([
+        ("--http-header", f"{k}={v}")
+      for k, v in self.session.headers.items()
+    ]))
 
-  }
-  BAM_ENTITLEMENT_URL = "https://media-entitlement.mlb.com/api/v3/jwt"
-  entitlement_response = session.get(
-      BAM_ENTITLEMENT_URL,
-      headers=ENTITLEMENT_HEADERS,
-      params=ENTITLEMENT_PARAMS
-  )
-
-  ENTITLEMENT_TOKEN = entitlement_response.content
-
-  headers = {
-      "Authorization": "Bearer %s" % (client_api_key),
-      "User-agent": USER_AGENT,
-      "Accept": "application/vnd.media-service+json; version=1",
-      "x-bamsdk-version": BAM_SDK_VERSION,
-      "x-bamsdk-platform": PLATFORM,
-      "origin": "https://www.mlb.com"
-  }
-  data = {
-      "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-      "platform": "browser",
-      "subject_token": ENTITLEMENT_TOKEN,
-      "subject_token_type": "urn:bamtech:params:oauth:token-type:account"
-  }
-  response = session.post(
-      BAM_TOKEN_URL,
-      data=data,
-      headers=headers
-  )
-  response.raise_for_status()
-  token_response = response.json()
-
-  access_token_expiry = datetime.now(tz=pytz.UTC) + \
-               timedelta(seconds=token_response["expires_in"])
-  return token_response["access_token"]
-
-def fetch_media_url(session, access_token, media_id, USER_AGENT, PLATFORM):
-  headers = {
-      "Authorization": access_token,
-      "User-agent": USER_AGENT,
-      "Accept": "application/vnd.media-service+json; version=1",
-      "x-bamsdk-version": "3.0",
-      "x-bamsdk-platform": PLATFORM,
-      "origin": "https://www.mlb.com"
-  }
-
-  STREAM_URL_TEMPLATE="https://edge.svcs.mlb.com/media/{media_id}/scenarios/browser~csai"
-  stream_url = STREAM_URL_TEMPLATE.format(media_id=media_id)
-  stream = session.get(
-      stream_url,
-      headers=headers
-  ).json()
-  return stream["stream"]["complete"]
-
-def run_streamlink(session, access_token, media_url, outfile_name):
-  header_args = []
-  cookie_args = []
-
-  session.headers = {
-    "Authorization": access_token
-  }
-
-  if session.headers:
-      header_args = list(
-          chain.from_iterable([
-              ("--http-header", f"{k}={v}")
-          for k, v in session.headers.items()
-      ]))
-
-  if session.cookies:
+    if self.session.cookies:
       cookie_args = list(
-          chain.from_iterable([
-              ("--http-cookie", f"{c.name}={c.value}")
-          for c in session.cookies
+        chain.from_iterable([
+          ("--http-cookie", f"{c.name}={c.value}")
+        for c in self.session.cookies
       ]))
 
-  cmd = [
+    cmd = [
       "streamlink",
-  ] + cookie_args + header_args + [
+    ] + cookie_args + header_args + [
       media_url,
       "best",
-  ] + ["-o", outfile_name]
+    ] + ["-o", outfile_name]
 
-  proc = subprocess.Popen(cmd)
-  proc.wait()
+    proc = subprocess.Popen(cmd)
+    proc.wait()
 
-def download(username, password, session, game_date, desired_team_abbr, outfile_name, USER_AGENT, PLATFORM):
-  teams = fetch_all_teams(session, game_date)
-  team_id = teams.get(desired_team_abbr)
-  schedule = fetch_schedule(session, game_date, team_id)
+  def download_stream(self):
+    self._get_access_token()
 
-  game = schedule["dates"][0]["games"][0]
-  media_id = get_media_id(game)
+    stream = self.session.get(
+        "https://edge.svcs.mlb.com/media/" + \
+          str(self.media_id) + "/scenarios/browser~csai",
+        headers={
+          "Authorization": self.access_token,
+          "Accept": "application/vnd.media-service+json; version=1",
+        }
+    ).json()
+    media_url = stream["stream"]["complete"]
 
-  session_token = fetch_session_token(session, username, password)
-  access_token = fetch_access_token(session, session_token, USER_AGENT, PLATFORM)
-  media_url = fetch_media_url(session, access_token, media_id, USER_AGENT, PLATFORM)
-  run_streamlink(session, access_token, media_url, outfile_name)
+    outfile_name = "mlbaudio." + self.game_date.strftime("%Y-%m-%d") + ".aac"
+    self._run_streamlink(media_url, outfile_name)
+
+class MlbDownloaderUi():
+  def __init__(self):
+    self._validate_cli_args()
+
+  def _validate_cli_args(self):
+    USAGE = "USAGE: python3 " + sys.argv[0] + " <YYYY-MM-DD> <team_abbreviation>"
+    if len(sys.argv) < 3:
+      print(USAGE)
+      sys.exit(1)
+    try:
+      self.game_date = dateutil.parser.parse(sys.argv[1])
+    except TypeError:
+      print("Invalid date provided.")
+      print(USAGE)
+      sys.exit(1)
+    self.desired_team_abbr = sys.argv[2]
+
+  def choose_stream(self, streams):
+    i = 0
+    for stream in streams:
+      print("[" + str(i) + "] " + stream["callLetters"])
+      i += 1
+    stream_index_chosen = False
+    while not stream_index_chosen:
+      try:
+        print("\nSelect a stream from the list above.")
+        chosen_stream_index = int(input())
+        if chosen_stream_index >= 0 and chosen_stream_index < i:
+          stream_index_chosen = True
+        else:
+          print("Invalid index.")
+      except ValueError:
+        print("Invalid index; please enter an integer.")
+    return streams[chosen_stream_index]["mediaId"]
 
 def main():
-  # TODO get username and password from a config file
-  session = requests.Session()
-  game_date = dateutil.parser.parse('2021-05-25') #TODO dynamic
-  desired_team_abbr = 'nym'
-  outfile_name = str(game_date) + "." + desired_team_abbr + ".aac"
-  USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv:56.0) "
-                "Gecko/20100101 Firefox/56.0.4")
-  PLATFORM = "macintosh"
-  download(username, password, session, game_date, desired_team_abbr, outfile_name, USER_AGENT, PLATFORM)
-  
-main()
+  ui = MlbDownloaderUi()
+  mlbapiutil = MlbApiUtil(ui.game_date, ui.desired_team_abbr)
+  mlbapiutil.media_id = ui.choose_stream(mlbapiutil.streams)
+  mlbapiutil.download_stream()
+
+if __name__ == "__main__":
+  main()
