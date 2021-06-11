@@ -21,9 +21,11 @@ class MlbApiUtil():
     self.streams = self._get_all_streams()
 
   def _get_team_id(self, abbr):
-    teams_url = ("http://statsapi.mlb.com/api/v1/teams"
-        "?sportId=1&" + str(self.game_date.year))
-    teams = self.session.get(teams_url).json()["teams"]
+    teams = self.session.get(
+      "http://statsapi.mlb.com/api/v1/teams", params={
+        'sportId': 1,
+        'season': str(self.game_date.year)
+    }).json()["teams"]
     for team in teams:
       if team["abbreviation"].lower() == abbr.lower():
         return team["id"]
@@ -33,16 +35,15 @@ class MlbApiUtil():
     sys.exit(1)
 
   def _get_game_info(self):
-    url = (
-      "http://statsapi.mlb.com/api/v1/schedule"
-      "?sportId=1&startDate={date}&endDate={date}"
-      "&teamId={team_id}"
-      "&hydrate=linescore,team,game(content(summary,media(epg)),tickets)"
-    ).format(
-      date = self.game_date.strftime("%Y-%m-%d"),
-      team_id = self.team,
-    )
-    schedule = self.session.get(url).json()
+    schedule = self.session.get("http://statsapi.mlb.com/api/v1/schedule",
+      params={
+        "sportId": 1,
+        "startDate": self.game_date.strftime("%Y-%m-%d"),
+        "endDate": self.game_date.strftime("%Y-%m-%d"),
+        "teamId": self.team,
+        "hydrate": "linescore,team,game(content(summary,media(epg)),tickets)"
+      }
+    ).json()
     return schedule["dates"][0]["games"][0]
 
   def _get_all_streams(self):
@@ -80,7 +81,11 @@ class MlbApiUtil():
         "username": self.username,
         "password": self.password,
       }).json()
-    self.session_token = response["sessionToken"]
+    try:
+      self.session_token = response["sessionToken"]
+    except KeyError:
+      print("The username/password combination you provided was rejected.")
+      sys.exit(1)
 
   def _get_access_token(self):
     self._get_session_token()
